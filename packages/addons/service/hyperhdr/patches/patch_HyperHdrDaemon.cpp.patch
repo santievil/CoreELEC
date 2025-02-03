@@ -1,0 +1,21 @@
+--- ./sources/hyperhdr/HyperHdrDaemon.cpp	2024-12-05 20:33:49.000000000 +0100
++++ ./sources/hyperhdr/HyperHdrDaemon.cpp	2025-01-30 22:37:29.522620203 +0100
+@@ -520,6 +520,18 @@
+ 				softwareGrabberInstance = candidate;
+ 		}
+ #endif
++#if defined(ENABLE_AMLOGIC)
++		if (softwareGrabberInstance == nullptr)
++		{
++			auto candidate = new AmlogicWrapper(deviceName, _rootPath);
++			if (!candidate->isActivated(force))
++			{
++				Warning(_log, "The system doesn't support the framebuffer system grabber");
++				candidate->deleteLater();
++			}
++			else
++				softwareGrabberInstance = candidate;
++		}
+ #if defined(ENABLE_FRAMEBUFFER)
+ 		if (softwareGrabberInstance == nullptr)
+ 		{

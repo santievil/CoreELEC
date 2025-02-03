@@ -1,0 +1,908 @@
+--- ./sources/grabber/CMakeLists.txt	2024-12-05 20:33:49.000000000 +0100
++++ ./sources/grabber/CMakeLists.txt	2025-01-30 22:37:29.522620203 +0100
+@@ -1,3 +1,6 @@
++if(ENABLE_AMLOGIC)
++	add_subdirectory(linux/amlogic)
++endif (ENABLE_AMLOGIC)
+ if (ENABLE_PIPEWIRE)
+ 	add_subdirectory(linux/pipewire)
+ endif (ENABLE_PIPEWIRE)
+--- ./sources/grabber/linux/amlogic/AmlogicGrabber.cpp	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/AmlogicGrabber.cpp	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,335 @@
++// STL includes
++#include <algorithm>
++#include <cassert>
++#include <iostream>
++
++// Linux includes
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++// qt
++#include <QFile>
++#include <QJsonObject>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QSize>
++
++// Local includes
++#include <utils/Logger.h>
++#include <grabber/amlogic/AmlogicGrabber.h>
++#include "Amvideocap.h"
++
++// Constants
++namespace {
++const bool verbose = false;
++
++const char DEFAULT_FB_DEVICE[] = "/dev/fb0";
++const char DEFAULT_VIDEO_DEVICE[] = "/dev/amvideo";
++const char DEFAULT_CAPTURE_DEVICE[] = "/dev/amvideocap0";
++const int  AMVIDEOCAP_WAIT_MAX_MS = 40;
++const int  AMVIDEOCAP_DEFAULT_RATE_HZ = 25;
++
++} //End of constants
++
++AmlogicGrabber::AmlogicGrabber()
++	: Grabber("AMLOGICGRABBER") // Minimum required width or height is 160
++	  , _captureDev(-1)
++	  , _videoDev(-1)
++	  , _lastError(0)
++	  , _fbGrabber(DEFAULT_FB_DEVICE)
++	  , _grabbingModeNotification(0)
++{
++	_image_ptr = _image_bgr.memptr();
++	_useImageResampler = true;
++}
++
++AmlogicGrabber::~AmlogicGrabber()
++{
++	closeDevice(_captureDev);
++	closeDevice(_videoDev);
++}
++
++bool AmlogicGrabber::setupScreen()
++{
++	bool rc (false);
++
++	QSize screenSize = _fbGrabber.getScreenSize(DEFAULT_FB_DEVICE);
++	if ( !screenSize.isEmpty() )
++	{
++		if (setWidthHeight(screenSize.width(), screenSize.height()))
++		{
++			rc = _fbGrabber.setupScreen();
++		}
++	}
++	return rc;
++}
++
++bool AmlogicGrabber::openDevice(int &fd, const char* dev)
++{
++	bool rc = true;
++	if (fd<0)
++	{
++		fd = ::open(dev, O_RDWR);
++		if ( fd < 0)
++		{
++			rc = false;
++		}
++	}
++	return rc;
++}
++
++void AmlogicGrabber::closeDevice(int &fd)
++{
++	if (fd >= 0)
++	{
++		::close(fd);
++		fd = -1;
++	}
++}
++
++bool AmlogicGrabber::isVideoPlaying()
++{
++	bool rc = false;
++	if(QFile::exists(DEFAULT_VIDEO_DEVICE))
++	{
++		int videoDisabled = 1;
++		if (!openDevice(_videoDev, DEFAULT_VIDEO_DEVICE))
++		{
++			Error(_log, "Failed to open video device(%s): %d - %s", DEFAULT_VIDEO_DEVICE, errno, strerror(errno));
++		}
++		else
++		{
++			// Check the video disabled flag
++			if(ioctl(_videoDev, AMSTREAM_IOC_GET_VIDEO_DISABLE, &videoDisabled) < 0)
++			{
++				Error(_log, "Failed to retrieve video state from device: %d - %s", errno, strerror(errno));
++				closeDevice(_videoDev);
++			}
++			else
++			{
++				if ( videoDisabled == 0 )
++				{
++					rc = true;
++				}
++			}
++		}
++
++	}
++	return rc;
++}
++
++int AmlogicGrabber::grabFrame(Image<ColorRgb> & image)
++{
++	int rc = 0;
++	if (_isEnabled && !_isDeviceInError)
++	{
++		// Make sure video is playing, else there is nothing to grab
++		if (isVideoPlaying())
++		{
++			if (_grabbingModeNotification!=1)
++			{
++				Info(_log, "Switch to VPU capture mode");
++				_grabbingModeNotification = 1;
++				_lastError = 0;
++			}
++
++			if (grabFrame_amvideocap(image) < 0) {
++				closeDevice(_captureDev);
++				rc = -1;
++			}
++		}
++		else
++		{
++			if (_grabbingModeNotification!=2)
++			{
++				Info( _log, "Switch to Framebuffer capture mode");
++				_grabbingModeNotification = 2;
++				_lastError = 0;
++			}
++			rc = _fbGrabber.grabFrame(image);
++		}
++	}
++	return rc;
++}
++
++int AmlogicGrabber::grabFrame_amvideocap(Image<ColorRgb> & image)
++{
++	int rc = 0;
++
++	// If the device is not open, attempt to open it
++	if (_captureDev < 0)
++	{
++		if (! openDevice(_captureDev, DEFAULT_CAPTURE_DEVICE))
++		{
++			ErrorIf( _lastError != 1, _log,"Failed to open the AMLOGIC device (%d - %s):", errno, strerror(errno));
++			_lastError = 1;
++			rc = -1;
++			return rc;
++		}
++	}
++
++	long r1 = ioctl(_captureDev, AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH, _width);
++	long r2 = ioctl(_captureDev, AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT, _height);
++	long r3 = ioctl(_captureDev, AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS, CAP_FLAG_AT_END);
++	long r4 = ioctl(_captureDev, AMVIDEOCAP_IOW_SET_WANTFRAME_WAIT_MAX_MS, AMVIDEOCAP_WAIT_MAX_MS);
++
++	if (r1<0 || r2<0 || r3<0 || r4<0 || _height==0 || _width==0)
++	{
++		ErrorIf(_lastError != 2,_log,"Failed to configure capture device (%d - %s)", errno, strerror(errno));
++		_lastError = 2;
++		rc = -1;
++	}
++	else
++	{
++		int linelen = ((_width + 31) & ~31) * 3;
++		size_t _bytesToRead = linelen * _height;
++
++		// Read the snapshot into the memory
++		ssize_t bytesRead   = pread(_captureDev, _image_ptr, _bytesToRead, 0);
++
++		if ( bytesRead < 0 && !EAGAIN && errno > 0 )
++		{
++			ErrorIf(_lastError != 3, _log,"Capture frame failed  failed - Retrying. Error [%d] - %s", errno, strerror(errno));
++			_lastError = 3;
++			rc = -1;
++		}
++		else
++		{
++			if (bytesRead != -1 && static_cast<ssize_t>(_bytesToRead) != bytesRead)
++			{
++				// Read of snapshot failed
++				ErrorIf(_lastError != 4, _log,"Capture failed to grab entire image [bytesToRead(%d) != bytesRead(%d)]", _bytesToRead, bytesRead);
++				_lastError = 4;
++				rc = -1;
++			}
++			else {
++				//If bytesRead = -1 but no error or EAGAIN or ENODATA, return last image to cover video pausing scenario
++				// EAGAIN : // 11 - Resource temporarily unavailable
++				// ENODATA: // 61 - No data available
++				_imageResampler.processImage(static_cast<uint8_t*>(_image_ptr),
++											  _width,
++											  _height,
++											  linelen,
++											  PixelFormat::BGR24, image);
++				_lastError = 0;
++				rc = 0;
++			}
++		}
++	}
++	return rc;
++}
++
++QJsonObject AmlogicGrabber::discover(const QJsonObject& params)
++{
++	DebugIf(verbose, _log, "params: [%s]", QString(QJsonDocument(params).toJson(QJsonDocument::Compact)).toUtf8().constData());
++
++	QJsonObject inputsDiscovered;
++
++	if(QFile::exists(DEFAULT_VIDEO_DEVICE) && QFile::exists(DEFAULT_CAPTURE_DEVICE) )
++	{
++		QJsonArray video_inputs;
++
++		QSize screenSize = _fbGrabber.getScreenSize();
++		if ( !screenSize.isEmpty() )
++		{
++			int fbIdx = _fbGrabber.getPath().right(1).toInt();
++
++			DebugIf(verbose, _log, "FB device [%s] found with resolution: %dx%d", QSTRING_CSTR(_fbGrabber.getPath()), screenSize.width(), screenSize.height());
++			QJsonArray fps = { 1, 5, 10, 15, 20, 25, 30};
++
++			QJsonObject in;
++
++			QString displayName;
++			displayName = QString("Display%1").arg(fbIdx);
++
++			in["name"] = displayName;
++			in["inputIdx"] = fbIdx;
++
++			QJsonArray formats;
++			QJsonObject format;
++
++			QJsonArray resolutionArray;
++
++			QJsonObject resolution;
++
++			resolution["width"] = screenSize.width();
++			resolution["height"] = screenSize.height();
++			resolution["fps"] = fps;
++
++			resolutionArray.append(resolution);
++
++			format["resolutions"] = resolutionArray;
++			formats.append(format);
++
++			in["formats"] = formats;
++			video_inputs.append(in);
++		}
++
++		if (!video_inputs.isEmpty())
++		{
++			inputsDiscovered["device"] = "amlogic";
++			inputsDiscovered["device_name"] = "AmLogic";
++			inputsDiscovered["type"] = "screen";
++			inputsDiscovered["video_inputs"] = video_inputs;
++
++			QJsonObject defaults, video_inputs_default, resolution_default;
++			resolution_default["fps"] = AMVIDEOCAP_DEFAULT_RATE_HZ;
++			video_inputs_default["resolution"] = resolution_default;
++			video_inputs_default["inputIdx"] = 0;
++			defaults["video_input"] = video_inputs_default;
++			inputsDiscovered["default"] = defaults;
++		}
++	}
++
++	if (inputsDiscovered.isEmpty())
++	{
++		DebugIf(verbose, _log, "No displays found to capture from!");
++	}
++
++	DebugIf(verbose, _log, "device: [%s]", QString(QJsonDocument(inputsDiscovered).toJson(QJsonDocument::Compact)).toUtf8().constData());
++
++	return inputsDiscovered;
++}
++
++void AmlogicGrabber::setVideoMode(VideoMode mode)
++{
++	Grabber::setVideoMode(mode);
++	_fbGrabber.setVideoMode(mode);
++}
++
++bool AmlogicGrabber::setPixelDecimation(int pixelDecimation)
++{
++	return ( Grabber::setPixelDecimation( pixelDecimation) &&
++			 _fbGrabber.setPixelDecimation( pixelDecimation));
++}
++
++void AmlogicGrabber::setCropping(int cropLeft, int cropRight, int cropTop, int cropBottom)
++{
++	Grabber::setCropping(cropLeft, cropRight, cropTop, cropBottom);
++	_fbGrabber.setCropping(cropLeft, cropRight, cropTop, cropBottom);
++}
++
++bool AmlogicGrabber::setWidthHeight(int width, int height)
++{
++	bool rc (false);
++	if ( Grabber::setWidthHeight(width, height) )
++	{
++		_image_bgr.resize(static_cast<unsigned>(width), static_cast<unsigned>(height));
++		_width = width;
++		_height = height;
++		_bytesToRead = _image_bgr.size();
++		_image_ptr = _image_bgr.memptr();
++		rc = _fbGrabber.setWidthHeight(width, height);
++	}
++	return rc;
++}
++
++bool AmlogicGrabber::setFramerate(int fps)
++{
++	return (Grabber::setFramerate(fps) &&
++			 _fbGrabber.setFramerate(fps));
++}
+--- ./sources/grabber/linux/amlogic/AmlogicWrapper.cpp	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/AmlogicWrapper.cpp	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,13 @@
++#include <grabber/amlogic/AmlogicWrapper.h>
++
++AmlogicWrapper::AmlogicWrapper(int pixelDecimation,	int updateRate_Hz)
++	: GrabberWrapper("Amlogic", &_grabber, updateRate_Hz)
++	  , _grabber()
++{
++	_grabber.setPixelDecimation(pixelDecimation);
++}
++
++void AmlogicWrapper::action()
++{
++	transferFrame(_grabber);
++}
+--- ./sources/grabber/linux/amlogic/Amvideocap.h	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/Amvideocap.h	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <exception>
++// #include <linux/videodev2.h>
++#include "ion.h"
++#include "meson_ion.h"
++#include "IonBuffer.h"
++
++#define AMVIDEOCAP_IOC_MAGIC  'V'
++#define CAP_FLAG_AT_CURRENT		0
++#define CAP_FLAG_AT_TIME_WINDOW	1
++#define CAP_FLAG_AT_END			2
++
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_FORMAT     		_IOW(AMVIDEOCAP_IOC_MAGIC, 0x01, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH      		_IOW(AMVIDEOCAP_IOC_MAGIC, 0x02, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT     		_IOW(AMVIDEOCAP_IOC_MAGIC, 0x03, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_TIMESTAMP_MS     	_IOW(AMVIDEOCAP_IOC_MAGIC, 0x04, unsigned long long)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_WAIT_MAX_MS     	_IOW(AMVIDEOCAP_IOC_MAGIC, 0x05, unsigned long long)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS     		_IOW(AMVIDEOCAP_IOC_MAGIC, 0x06, int)
++
++#define AMVIDEOCAP_IOR_GET_FRAME_FORMAT					_IOR(AMVIDEOCAP_IOC_MAGIC, 0x10, int)
++#define AMVIDEOCAP_IOR_GET_FRAME_WIDTH					_IOR(AMVIDEOCAP_IOC_MAGIC, 0x11, int)
++#define AMVIDEOCAP_IOR_GET_FRAME_HEIGHT					_IOR(AMVIDEOCAP_IOC_MAGIC, 0x12, int)
++#define AMVIDEOCAP_IOR_GET_FRAME_TIMESTAMP_MS			_IOR(AMVIDEOCAP_IOC_MAGIC, 0x13, int)
++
++#define AMVIDEOCAP_IOR_GET_SRCFRAME_FORMAT      		_IOR(AMVIDEOCAP_IOC_MAGIC, 0x20, int)
++#define AMVIDEOCAP_IOR_GET_SRCFRAME_WIDTH       		_IOR(AMVIDEOCAP_IOC_MAGIC, 0x21, int)
++#define AMVIDEOCAP_IOR_GET_SRCFRAME_HEIGHT      		_IOR(AMVIDEOCAP_IOC_MAGIC, 0x22, int)
++
++#define AMVIDEOCAP_IOR_GET_STATE     	   				_IOR(AMVIDEOCAP_IOC_MAGIC, 0x31, int)
++#define AMVIDEOCAP_IOW_SET_START_CAPTURE   				_IOW(AMVIDEOCAP_IOC_MAGIC, 0x32, int)
++#define AMVIDEOCAP_IOW_SET_CANCEL_CAPTURE  				_IOW(AMVIDEOCAP_IOC_MAGIC, 0x33, int)
++
++#define AMSTREAM_IOC_MAGIC 'S'
++#define AMSTREAM_IOC_GET_VIDEO_DISABLE  				_IOR((AMSTREAM_IOC_MAGIC), 0x48, int)
++
++enum amvideocap_state{
++	AMVIDEOCAP_STATE_INIT=0,
++	AMVIDEOCAP_STATE_ON_CAPTURE=200,
++	AMVIDEOCAP_STATE_FINISHED_CAPTURE=300,
++	AMVIDEOCAP_STATE_ERROR=0xffff,
++	};
+--- ./sources/grabber/linux/amlogic/CMakeLists.txt	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/CMakeLists.txt	2025-01-30 21:59:28.358005000 +0100
+@@ -0,0 +1,22 @@
++INCLUDE (CheckIncludeFiles)
++
++# Define the current source locations
++SET(CURRENT_HEADER_DIR ${CMAKE_SOURCE_DIR}/include/grabber/linux/amlogic)
++SET(CURRENT_SOURCE_DIR ${CMAKE_SOURCE_DIR}/sources/grabber/linux/amlogic)
++
++FILE ( GLOB AmlogicSOURCES "${CURRENT_HEADER_DIR}/Amlogic*.h"  "${CURRENT_SOURCE_DIR}/*.h"  "${CURRENT_SOURCE_DIR}/*.cpp" )
++
++add_library(amlogic-grabber OBJECT ${AmlogicSOURCES} )
++
++target_link_libraries(amlogic-grabber
++	hyperion
++	# ${QT_LIBRARIES})
++	Qt${Qt_VERSION}::Core
++	Qt${Qt_VERSION}::Network
++)
++	
++	
++if(USE_PRECOMPILED_HEADERS AND COMMAND target_precompile_headers)
++	target_precompile_headers(amlogic-grabber REUSE_FROM precompiled_hyperhdr_headers)
++endif()
++
+--- ./sources/grabber/linux/amlogic/IonBuffer.cpp	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/IonBuffer.cpp	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,19 @@
++/*
++*
++* Copyright (C) 2016 OtherCrashOverride@users.noreply.github.com.
++* All rights reserved.
++*
++* This program is free software; you can redistribute it and/or modify
++* it under the terms of the GNU General Public License version 2, as
++* published by the Free Software Foundation.
++*
++* This program is distributed in the hope that it will be useful, but WITHOUT
++* ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++* FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++* more details.
++*
++*/
++#include "IonBuffer.h"
++
++int IonBuffer::ion_fd = -1;
++
+--- ./sources/grabber/linux/amlogic/IonBuffer.h	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/IonBuffer.h	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,187 @@
++/*
++ *
++ * Copyright (C) 2016 OtherCrashOverride@users.noreply.github.com.
++ * All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++*/
++#pragma once
++
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <stdexcept>
++
++#include "ion.h"
++#include "meson_ion.h"
++
++
++class IonBuffer
++{
++	size_t bufferSize = 0;
++	ion_user_handle_t handle = 0;
++	int exportHandle = 0;
++	size_t length = 0;
++	unsigned long physicalAddress = 0;
++
++
++	static int ion_fd; // = -1;
++
++
++public:
++
++	size_t BufferSize() const
++	{
++		return bufferSize;
++	}
++
++	ion_user_handle_t Handle() const
++	{
++		return handle;
++	}
++
++	int ExportHandle() const
++	{
++		return exportHandle;
++	}
++
++	size_t Length() const
++	{
++		return length;
++	}
++
++	unsigned long PhysicalAddress() const
++	{
++		return physicalAddress;
++	}
++
++	IonBuffer(size_t bufferSize)
++		: bufferSize(bufferSize)
++	{
++		if (bufferSize < 1)
++			throw std::runtime_error("bufferSize < 1");
++
++
++		if (ion_fd < 0)
++		{
++			ion_fd = open("/dev/ion", O_RDWR);
++			if (ion_fd < 0)
++			{
++				throw std::runtime_error("open ion failed.");
++			}
++		}
++
++
++		int io;
++
++		// Allocate a buffer
++		ion_allocation_data allocation_data = { 0 };
++		allocation_data.len = bufferSize;
++		allocation_data.heap_id_mask = ION_HEAP_CARVEOUT_MASK;
++
++#if defined(__aarch64__)
++		allocation_data.flags = ION_FLAG_CACHED_NEEDS_SYNC; //ION_FLAG_CACHED;
++#else
++		allocation_data.flags = 0;
++#endif
++
++		io = ioctl(ion_fd, ION_IOC_ALLOC, &allocation_data);
++		if (io != 0)
++		{
++			throw std::runtime_error("ION_IOC_ALLOC failed.");
++		}
++
++// 		fprintf(stderr, "ion handle=%d\n", allocation_data.handle);
++
++
++		// Map/share the buffer
++		ion_fd_data ionData = { 0 };
++		ionData.handle = allocation_data.handle;
++
++		io = ioctl(ion_fd, ION_IOC_SHARE, &ionData);
++		if (io != 0)
++		{
++			throw std::runtime_error("ION_IOC_SHARE failed.");
++		}
++
++// 		fprintf(stderr, "ion map=%d\n", ionData.fd);
++
++
++		// Get the physical address for the buffer
++		meson_phys_data physData = { 0 };
++		physData.handle = ionData.fd;
++
++		ion_custom_data ionCustomData = { 0 };
++		ionCustomData.cmd = ION_IOC_MESON_PHYS_ADDR;
++		ionCustomData.arg = (long unsigned int)&physData;
++
++		io = ioctl(ion_fd, ION_IOC_CUSTOM, &ionCustomData);
++		if (io != 0)
++		{
++			throw std::runtime_error("ION_IOC_CUSTOM failed.");
++		}
++
++		// Assignment
++		handle = allocation_data.handle;
++		exportHandle = ionData.fd;
++		length = allocation_data.len;
++		physicalAddress = physData.phys_addr;
++
++// 		fprintf(stderr, "ion phys_addr=%lu\n", physicalAddress);
++	}
++
++	virtual ~IonBuffer() noexcept(false)
++	{
++		ion_handle_data ionHandleData = { 0 };
++		ionHandleData.handle = handle;
++
++		int io = ioctl(ion_fd, ION_IOC_FREE, &ionHandleData);
++		if (io != 0)
++		{
++			throw std::runtime_error("ION_IOC_FREE failed.");
++		}
++	}
++
++
++	void Sync()
++	{
++
++#if defined(__aarch64__)
++		ion_fd_data ionFdData = { 0 };
++		ionFdData.fd = ExportHandle();
++
++		int io = ioctl(ion_fd, ION_IOC_SYNC, &ionFdData);
++		if (io != 0)
++		{
++			throw std::runtime_error("ION_IOC_SYNC failed.");
++		}
++#endif
++
++	}
++
++	void* Map()
++	{
++		void* result = mmap(NULL,
++			Length(),
++			PROT_READ | PROT_WRITE,
++			MAP_FILE | MAP_SHARED,
++			ExportHandle(),
++			0);
++		if (result == MAP_FAILED)
++		{
++			throw std::runtime_error("mmap failed.");
++		}
++
++		return result;
++	}
++};
+--- ./sources/grabber/linux/amlogic/ion.h	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/ion.h	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,197 @@
++/*
++ * drivers/staging/android/uapi/ion.h
++ *
++ * Copyright (C) 2011 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _UAPI_LINUX_ION_H
++#define _UAPI_LINUX_ION_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++typedef int ion_user_handle_t;
++
++/**
++ * enum ion_heap_types - list of all possible types of heaps
++ * @ION_HEAP_TYPE_SYSTEM:	 memory allocated via vmalloc
++ * @ION_HEAP_TYPE_SYSTEM_CONTIG: memory allocated via kmalloc
++ * @ION_HEAP_TYPE_CARVEOUT:	 memory allocated from a prereserved
++ * 				 carveout heap, allocations are physically
++ * 				 contiguous
++ * @ION_HEAP_TYPE_DMA:		 memory allocated via DMA API
++ * @ION_NUM_HEAPS:		 helper for iterating over heaps, a bit mask
++ * 				 is used to identify the heaps, so only 32
++ * 				 total heap types are supported
++ */
++enum ion_heap_type {
++	ION_HEAP_TYPE_SYSTEM,
++	ION_HEAP_TYPE_SYSTEM_CONTIG,
++	ION_HEAP_TYPE_CARVEOUT,
++	ION_HEAP_TYPE_CHUNK,
++	ION_HEAP_TYPE_DMA,
++	ION_HEAP_TYPE_CUSTOM, /* must be last so device specific heaps always
++				 are at the end of this enum */
++	ION_NUM_HEAPS = 16,
++};
++
++#define ION_HEAP_SYSTEM_MASK		(1 << ION_HEAP_TYPE_SYSTEM)
++#define ION_HEAP_SYSTEM_CONTIG_MASK	(1 << ION_HEAP_TYPE_SYSTEM_CONTIG)
++#define ION_HEAP_CARVEOUT_MASK		(1 << ION_HEAP_TYPE_CARVEOUT)
++#define ION_HEAP_TYPE_DMA_MASK		(1 << ION_HEAP_TYPE_DMA)
++
++#define ION_NUM_HEAP_IDS		sizeof(unsigned int) * 8
++
++/**
++ * allocation flags - the lower 16 bits are used by core ion, the upper 16
++ * bits are reserved for use by the heaps themselves.
++ */
++#define ION_FLAG_CACHED 1		/* mappings of this buffer should be
++					   cached, ion will do cache
++					   maintenance when the buffer is
++					   mapped for dma */
++#define ION_FLAG_CACHED_NEEDS_SYNC 2	/* mappings of this buffer will created
++					   at mmap time, if this is set
++					   caches must be managed manually */
++
++/**
++ * DOC: Ion Userspace API
++ *
++ * create a client by opening /dev/ion
++ * most operations handled via following ioctls
++ *
++ */
++
++/**
++ * struct ion_allocation_data - metadata passed from userspace for allocations
++ * @len:		size of the allocation
++ * @align:		required alignment of the allocation
++ * @heap_id_mask:	mask of heap ids to allocate from
++ * @flags:		flags passed to heap
++ * @handle:		pointer that will be populated with a cookie to use to 
++ *			refer to this allocation
++ *
++ * Provided by userspace as an argument to the ioctl
++ */
++struct ion_allocation_data {
++	size_t len;
++	size_t align;
++	unsigned int heap_id_mask;
++	unsigned int flags;
++	ion_user_handle_t handle;
++};
++
++/**
++ * struct ion_fd_data - metadata passed to/from userspace for a handle/fd pair
++ * @handle:	a handle
++ * @fd:		a file descriptor representing that handle
++ *
++ * For ION_IOC_SHARE or ION_IOC_MAP userspace populates the handle field with
++ * the handle returned from ion alloc, and the kernel returns the file
++ * descriptor to share or map in the fd field.  For ION_IOC_IMPORT, userspace
++ * provides the file descriptor and the kernel returns the handle.
++ */
++struct ion_fd_data {
++	ion_user_handle_t handle;
++	int fd;
++};
++
++/**
++ * struct ion_handle_data - a handle passed to/from the kernel
++ * @handle:	a handle
++ */
++struct ion_handle_data {
++	ion_user_handle_t handle;
++};
++
++/**
++ * struct ion_custom_data - metadata passed to/from userspace for a custom ioctl
++ * @cmd:	the custom ioctl function to call
++ * @arg:	additional data to pass to the custom ioctl, typically a user
++ *		pointer to a predefined structure
++ *
++ * This works just like the regular cmd and arg fields of an ioctl.
++ */
++struct ion_custom_data {
++	unsigned int cmd;
++	unsigned long arg;
++};
++
++#define ION_IOC_MAGIC		'I'
++
++/**
++ * DOC: ION_IOC_ALLOC - allocate memory
++ *
++ * Takes an ion_allocation_data struct and returns it with the handle field
++ * populated with the opaque handle for the allocation.
++ */
++#define ION_IOC_ALLOC		_IOWR(ION_IOC_MAGIC, 0, \
++				      struct ion_allocation_data)
++
++/**
++ * DOC: ION_IOC_FREE - free memory
++ *
++ * Takes an ion_handle_data struct and frees the handle.
++ */
++#define ION_IOC_FREE		_IOWR(ION_IOC_MAGIC, 1, struct ion_handle_data)
++
++/**
++ * DOC: ION_IOC_MAP - get a file descriptor to mmap
++ *
++ * Takes an ion_fd_data struct with the handle field populated with a valid
++ * opaque handle.  Returns the struct with the fd field set to a file
++ * descriptor open in the current address space.  This file descriptor
++ * can then be used as an argument to mmap.
++ */
++#define ION_IOC_MAP		_IOWR(ION_IOC_MAGIC, 2, struct ion_fd_data)
++
++/**
++ * DOC: ION_IOC_SHARE - creates a file descriptor to use to share an allocation
++ *
++ * Takes an ion_fd_data struct with the handle field populated with a valid
++ * opaque handle.  Returns the struct with the fd field set to a file
++ * descriptor open in the current address space.  This file descriptor
++ * can then be passed to another process.  The corresponding opaque handle can
++ * be retrieved via ION_IOC_IMPORT.
++ */
++#define ION_IOC_SHARE		_IOWR(ION_IOC_MAGIC, 4, struct ion_fd_data)
++
++/**
++ * DOC: ION_IOC_IMPORT - imports a shared file descriptor
++ *
++ * Takes an ion_fd_data struct with the fd field populated with a valid file
++ * descriptor obtained from ION_IOC_SHARE and returns the struct with the handle
++ * filed set to the corresponding opaque handle.
++ */
++#define ION_IOC_IMPORT		_IOWR(ION_IOC_MAGIC, 5, struct ion_fd_data)
++
++/**
++ * DOC: ION_IOC_SYNC - syncs a shared file descriptors to memory
++ *
++ * Deprecated in favor of using the dma_buf api's correctly (syncing
++ * will happend automatically when the buffer is mapped to a device).
++ * If necessary should be used after touching a cached buffer from the cpu,
++ * this will make the buffer in memory coherent.
++ */
++#define ION_IOC_SYNC		_IOWR(ION_IOC_MAGIC, 7, struct ion_fd_data)
++
++/**
++ * DOC: ION_IOC_CUSTOM - call architecture specific ion ioctl
++ *
++ * Takes the argument of the architecture specific ioctl to call and
++ * passes appropriate userdata for that ioctl
++ */
++#define ION_IOC_CUSTOM		_IOWR(ION_IOC_MAGIC, 6, struct ion_custom_data)
++
++#endif /* _UAPI_LINUX_ION_H */
++
+--- ./sources/grabber/linux/amlogic/meson_ion.h	1970-01-01 01:00:00.000000000 +0100
++++ ./sources/grabber/linux/amlogic/meson_ion.h	2024-01-18 10:00:19.000000000 +0100
+@@ -0,0 +1,60 @@
++/*
++ * include/linux/amlogic/dev_ion.h
++ *
++ * Copyright (C) 2014 Amlogic, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __LINUX_AMLOGIC_ION_H__
++#define __LINUX_AMLOGIC_ION_H__
++
++//#include <linux/types.h>
++//#include <ion/ion.h>
++
++/**
++* CUSTOM IOCTL - CMD
++*/
++
++#define ION_IOC_MESON_PHYS_ADDR             8
++
++struct meson_phys_data {
++	int handle;
++	unsigned int phys_addr;
++	unsigned int size;
++};
++
++
++#if 0
++
++/**
++ * meson_ion_client_create() -  allocate a client and returns it
++ * @heap_type_mask:	mask of heaps this client can allocate from
++ * @name:		used for debugging
++ */
++struct ion_client *meson_ion_client_create(unsigned int heap_mask,
++		const char *name);
++
++/**
++ * meson_ion_share_fd_to_phys -
++ * associate with a share fd
++ * @client:	the client
++ * @share_fd: passed from the user space
++ * @addr point to the physical address
++ * @size point to the size of this ion buffer
++ */
++
++int meson_ion_share_fd_to_phys(struct ion_client *client,
++		int share_fd, ion_phys_addr_t *addr, size_t *len);
++#endif
++
++#endif
++
